@@ -25,11 +25,12 @@ read_token() {
     local creds="$HOME/.claude/.credentials.json"
     [ -f "$creds" ] || return 1
     local tok
-    tok=$(python3 -c "
-import json, sys
-d = json.load(open('$creds'))
+    tok=$(CREDS_FILE="$creds" python3 - <<'PYEOF'
+import json, os
+d = json.load(open(os.environ['CREDS_FILE']))
 print(d.get('oauth', {}).get('access_token', '') or d.get('accessToken', ''))
-" 2>/dev/null)
+PYEOF
+    )
     [[ "$tok" == sk-ant-* ]] && echo "$tok" || return 1
 }
 
@@ -44,8 +45,10 @@ read_cookie() {
         cookie=$(python3 - "$ff_db" <<'PYEOF'
 import sqlite3, shutil, tempfile, os, sys
 src = sys.argv[1]
-tmp = tempfile.mktemp(suffix='.sqlite')
+fd, tmp = tempfile.mkstemp(suffix='.sqlite')
+os.close(fd)
 shutil.copy2(src, tmp)
+conn = None
 try:
     conn = sqlite3.connect(tmp)
     row = conn.execute(
@@ -54,7 +57,7 @@ try:
     ).fetchone()
     if row: print(row[0])
 finally:
-    conn.close()
+    if conn: conn.close()
     os.unlink(tmp)
 PYEOF
 )
@@ -72,8 +75,10 @@ PYEOF
         cookie=$(python3 - "$db" <<'PYEOF'
 import sqlite3, shutil, tempfile, os, sys
 src = sys.argv[1]
-tmp = tempfile.mktemp(suffix='.sqlite')
+fd, tmp = tempfile.mkstemp(suffix='.sqlite')
+os.close(fd)
 shutil.copy2(src, tmp)
+conn = None
 try:
     conn = sqlite3.connect(tmp)
     row = conn.execute(
@@ -82,7 +87,7 @@ try:
     ).fetchone()
     if row and row[0]: print(row[0])
 finally:
-    conn.close()
+    if conn: conn.close()
     os.unlink(tmp)
 PYEOF
 )
@@ -112,11 +117,12 @@ def mins_until(iso):
     except:
         return -1
 
-sess = None
+# five_hour preferred; falls back to weekly buckets if 5h window absent
+primary = None
 for key in ('five_hour', 'seven_day', 'seven_day_sonnet', 'seven_day_opus'):
     w = body.get(key)
     if w and w.get('utilization') is not None:
-        sess = w
+        primary = w
         break
 
 week = None
@@ -126,8 +132,8 @@ for key in ('seven_day', 'seven_day_sonnet', 'seven_day_opus'):
         week = w
         break
 
-su = round(sess['utilization']) if sess else 0
-sr = mins_until(sess.get('resets_at')) if sess else -1
+su = round(primary['utilization']) if primary else 0
+sr = mins_until(primary.get('resets_at')) if primary else -1
 wu = round(week['utilization']) if week else 0
 wr = mins_until(week.get('resets_at')) if week else -1
 st = 'limited' if (su >= 100 or wu >= 100) else 'allowed'

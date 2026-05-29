@@ -11,8 +11,10 @@ custom GATT service. Uses bleak (CoreBluetooth backend on macOS).
 """
 
 import asyncio
+import datetime
 import getpass
 import glob
+import hashlib
 import json
 import os
 import re
@@ -46,7 +48,7 @@ CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
-WEB_ORG_URL   = "https://claude.ai/api/organizations"
+WEB_ORG_URL = "https://claude.ai/api/organizations"
 
 
 def log(msg: str) -> None:
@@ -167,17 +169,17 @@ def _build_payload(usage: dict) -> dict:
         if not iso:
             return -1
         try:
-            import datetime
             ts = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
             return max(0, int((ts - now) / 60))
         except Exception:
             return -1
 
-    sess = None
+    # five_hour preferred; falls back to weekly buckets if 5h window absent
+    primary = None
     for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
         w = usage.get(key)
         if isinstance(w, dict) and w.get("utilization") is not None:
-            sess = w
+            primary = w
             break
 
     week = None
@@ -187,8 +189,8 @@ def _build_payload(usage: dict) -> dict:
             week = w
             break
 
-    su = round(sess["utilization"]) if sess else 0
-    sr = mins_until(sess.get("resets_at")) if sess else -1
+    su = round(primary["utilization"]) if primary else 0
+    sr = mins_until(primary.get("resets_at")) if primary else -1
     wu = round(week["utilization"]) if week else 0
     wr = mins_until(week.get("resets_at")) if week else -1
     st = "limited" if (su >= 100 or wu >= 100) else "allowed"
@@ -263,6 +265,8 @@ def _read_safari_cookie() -> str | None:
                     domain_off = struct.unpack_from("<I", page, co + 16)[0]
                     name_off   = struct.unpack_from("<I", page, co + 20)[0]
                     value_off  = struct.unpack_from("<I", page, co + 28)[0]
+                    if co + domain_off >= len(page) or co + name_off >= len(page) or co + value_off >= len(page):
+                        continue
                     domain = page[co + domain_off:].split(b"\x00")[0].decode("utf-8", "ignore")
                     name   = page[co + name_off:].split(b"\x00")[0].decode("utf-8", "ignore")
                     value  = page[co + value_off:].split(b"\x00")[0].decode("utf-8", "ignore")
@@ -284,7 +288,7 @@ def _chrome_decrypt(key: bytes, encrypted: bytes) -> str | None:
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         from cryptography.hazmat.backends import default_backend
-        iv = b" " * 16
+        iv = b" " * 16  # Chrome uses all-space IV with PBKDF2-SHA1 key derivation
         cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
         dec = cipher.decryptor()
         plain = dec.update(encrypted[3:]) + dec.finalize()
@@ -304,12 +308,12 @@ def _read_chrome_cookie(db_path: str, keychain_service: str) -> str | None:
             ["security", "find-generic-password", "-w", "-s", keychain_service],
             capture_output=True, text=True, timeout=5,
         ).stdout.strip()
-        import hashlib
         key = hashlib.pbkdf2_hmac("sha1", pw.encode(), b"saltysalt", 1003, 16)
     except Exception:
         pass
 
-    tmp = tempfile.mktemp(suffix=".sqlite")
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
     try:
         shutil.copy2(db_path, tmp)
         conn = sqlite3.connect(tmp)
@@ -337,7 +341,8 @@ def _read_chrome_cookie(db_path: str, keychain_service: str) -> str | None:
 
 def _read_firefox_cookie() -> str | None:
     for db in glob.glob(str(Path.home() / "Library/Application Support/Firefox/Profiles/*/cookies.sqlite")):
-        tmp = tempfile.mktemp(suffix=".sqlite")
+        fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
         try:
             shutil.copy2(db, tmp)
             conn = sqlite3.connect(tmp)
