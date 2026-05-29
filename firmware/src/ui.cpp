@@ -135,6 +135,16 @@ static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
 #define ANIM_MSG_MS     4000
 
+static int16_t logo_base_y = 0;
+
+static void logo_walk_y_cb(void* obj, int32_t val) {
+    lv_obj_set_y((lv_obj_t*)obj, logo_base_y + val);
+}
+
+static void logo_walk_rot_cb(void* obj, int32_t val) {
+    lv_obj_set_style_transform_rotation((lv_obj_t*)obj, val, 0);
+}
+
 static const char* const spinner_frames[] = {
     "\xC2\xB7", "\xE2\x9C\xBB", "\xE2\x9C\xBD",
     "\xE2\x9C\xB6", "\xE2\x9C\xB3", "\xE2\x9C\xA2",
@@ -440,6 +450,34 @@ void ui_init(void) {
     logo_img = lv_image_create(scr);
     lv_image_set_src(logo_img, &logo_dsc);
     lv_obj_set_pos(logo_img, L.margin, L.title_y - 10);
+    logo_base_y = L.title_y - 10;
+    lv_obj_set_style_transform_pivot_x(logo_img, LOGO_WIDTH / 2, 0);
+    lv_obj_set_style_transform_pivot_y(logo_img, LOGO_HEIGHT, 0);
+
+    // Y bob — up 4px and back, 400ms per half
+    lv_anim_t ay;
+    lv_anim_init(&ay);
+    lv_anim_set_var(&ay, logo_img);
+    lv_anim_set_exec_cb(&ay, logo_walk_y_cb);
+    lv_anim_set_values(&ay, 0, -4);
+    lv_anim_set_duration(&ay, 300);
+    lv_anim_set_reverse_duration(&ay, 300);
+    lv_anim_set_path_cb(&ay, lv_anim_path_ease_in_out);
+    lv_anim_set_repeat_count(&ay, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&ay);
+
+    // Rotation sway — ±30 tenths-of-degree (±3°), offset by half period for stride feel
+    lv_anim_t ar;
+    lv_anim_init(&ar);
+    lv_anim_set_var(&ar, logo_img);
+    lv_anim_set_exec_cb(&ar, logo_walk_rot_cb);
+    lv_anim_set_values(&ar, -30, 30);
+    lv_anim_set_duration(&ar, 300);
+    lv_anim_set_reverse_duration(&ar, 300);
+    lv_anim_set_delay(&ar, 150);
+    lv_anim_set_path_cb(&ar, lv_anim_path_ease_in_out);
+    lv_anim_set_repeat_count(&ar, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&ar);
 
     battery_img = lv_image_create(scr);
     lv_image_set_src(battery_img, &battery_dscs[0]);
