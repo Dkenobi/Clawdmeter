@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """Claude Usage Tracker Daemon (BLE) — macOS port of claude-usage-daemon.sh.
 
-Polls Claude API rate-limit headers and writes a JSON payload to the
-ESP32 "Claude Controller" peripheral over a custom GATT service. Uses
-bleak (CoreBluetooth backend on macOS).
+Option A (preferred): reads OAuth token from macOS Keychain or
+~/.claude/.credentials.json, polls GET /api/oauth/usage.
+Option B (fallback): extracts sessionKey cookie from Safari / Chrome /
+Chromium / Brave / Firefox, polls claude.ai org usage endpoint.
+
+Writes a JSON payload to the ESP32 "Claude Controller" peripheral over a
+custom GATT service. Uses bleak (CoreBluetooth backend on macOS).
 """
 
 import asyncio
+import datetime
 import getpass
+import glob
+import hashlib
 import json
 import os
 import re
+import shutil
 import signal
+import sqlite3
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,18 +47,8 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 
-API_URL = "https://api.anthropic.com/v1/messages"
-API_HEADERS_TEMPLATE = {
-    "anthropic-version": "2023-06-01",
-    "anthropic-beta": "oauth-2025-04-20",
-    "Content-Type": "application/json",
-    "User-Agent": "claude-code/2.1.5",
-}
-API_BODY = {
-    "model": "claude-haiku-4-5-20251001",
-    "max_tokens": 1,
-    "messages": [{"role": "user", "content": "hi"}],
-}
+USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
+WEB_ORG_URL = "https://claude.ai/api/organizations"
 
 
 def log(msg: str) -> None:
@@ -73,6 +74,9 @@ def _extract_access_token(blob: str) -> str | None:
         # direct: {"accessToken": "..."}
         if isinstance(data.get("accessToken"), str):
             return data["accessToken"]
+        # new spec: {"oauth": {"access_token": "..."}}
+        if isinstance(data.get("oauth"), dict) and isinstance(data["oauth"].get("access_token"), str):
+            return data["oauth"]["access_token"]
         # nested: {"claudeAiOauth": {"accessToken": "..."}}
         for v in data.values():
             if isinstance(v, dict) and isinstance(v.get("accessToken"), str):
@@ -157,47 +161,279 @@ async def scan_for_device() -> str | None:
     return None
 
 
-async def poll_api(token: str) -> dict | None:
-    headers = dict(API_HEADERS_TEMPLATE)
-    headers["Authorization"] = f"Bearer {token}"
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as http:
-            resp = await http.post(API_URL, headers=headers, json=API_BODY)
-    except httpx.HTTPError as e:
-        log(f"API call failed: {e}")
-        return None
-    if resp.status_code >= 400:
-        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
-        return None
-
-    def hdr(name: str, default: str = "0") -> str:
-        return resp.headers.get(name, default)
-
+def _build_payload(usage: dict) -> dict:
+    """Convert /api/oauth/usage (or claude.ai org usage) JSON to BLE payload."""
     now = time.time()
 
-    def reset_minutes(reset_ts: str) -> int:
+    def mins_until(iso: str | None) -> int:
+        if not iso:
+            return -1
         try:
-            r = float(reset_ts)
-        except ValueError:
-            return 0
-        mins = (r - now) / 60.0
-        return int(round(mins)) if mins > 0 else 0
+            ts = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+            return max(0, int((ts - now) / 60))
+        except Exception:
+            return -1
 
-    def pct(util: str) -> int:
-        try:
-            return int(round(float(util) * 100))
-        except ValueError:
-            return 0
+    # five_hour preferred; falls back to weekly buckets if 5h window absent
+    primary = None
+    for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
+        w = usage.get(key)
+        if isinstance(w, dict) and w.get("utilization") is not None:
+            primary = w
+            break
 
-    payload = {
-        "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-        "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-        "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-        "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
-        "ok": True,
+    week = None
+    for key in ("seven_day", "seven_day_sonnet", "seven_day_opus"):
+        w = usage.get(key)
+        if isinstance(w, dict) and w.get("utilization") is not None:
+            week = w
+            break
+
+    su = round(primary["utilization"]) if primary else 0
+    sr = mins_until(primary.get("resets_at")) if primary else -1
+    wu = round(week["utilization"]) if week else 0
+    wr = mins_until(week.get("resets_at")) if week else -1
+    st = "limited" if (su >= 100 or wu >= 100) else "allowed"
+
+    return {"s": su, "sr": sr, "w": wu, "wr": wr, "st": st, "ok": True}
+
+
+async def poll_oauth(token: str) -> dict | None:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "Accept": "application/json",
+        "User-Agent": "claude-code/2.1.0",
     }
-    return payload
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            resp = await http.get(USAGE_API_URL, headers=headers)
+    except httpx.HTTPError as e:
+        log(f"OAuth poll failed: {e}")
+        return None
+
+    if resp.status_code == 401:
+        log("OAuth: token expired — run 'claude login'")
+        return None
+    if resp.status_code == 403:
+        log("OAuth: wrong token scope — run 'claude setup-token'")
+        return None
+    if resp.status_code == 429:
+        retry = resp.headers.get("retry-after", "60")
+        log(f"OAuth: rate limited, backing off {retry}s")
+        await asyncio.sleep(float(retry) if retry.isdigit() else 60)
+        return None
+    if resp.status_code != 200:
+        log(f"OAuth: HTTP {resp.status_code}")
+        return None
+
+    try:
+        return _build_payload(resp.json())
+    except Exception as e:
+        log(f"OAuth: payload parse failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Option B: browser sessionKey cookie
+# ---------------------------------------------------------------------------
+
+def _read_safari_cookie() -> str | None:
+    path = Path.home() / "Library" / "Cookies" / "Cookies.binarycookies"
+    if not path.exists():
+        return None
+    try:
+        data = path.read_bytes()
+        if data[:4] != b"cook":
+            return None
+        num_pages = struct.unpack(">I", data[4:8])[0]
+        page_sizes = struct.unpack(">" + "I" * num_pages, data[8:8 + num_pages * 4])
+        offset = 8 + num_pages * 4
+        for page_size in page_sizes:
+            page = data[offset:offset + page_size]
+            offset += page_size
+            if len(page) < 8:
+                continue
+            num_cookies = struct.unpack("<I", page[4:8])[0]
+            if not num_cookies or len(page) < 8 + num_cookies * 4:
+                continue
+            cookie_offsets = struct.unpack("<" + "I" * num_cookies, page[8:8 + num_cookies * 4])
+            for co in cookie_offsets:
+                try:
+                    if co + 32 > len(page):
+                        continue
+                    domain_off = struct.unpack_from("<I", page, co + 16)[0]
+                    name_off   = struct.unpack_from("<I", page, co + 20)[0]
+                    value_off  = struct.unpack_from("<I", page, co + 28)[0]
+                    if co + domain_off >= len(page) or co + name_off >= len(page) or co + value_off >= len(page):
+                        continue
+                    domain = page[co + domain_off:].split(b"\x00")[0].decode("utf-8", "ignore")
+                    name   = page[co + name_off:].split(b"\x00")[0].decode("utf-8", "ignore")
+                    value  = page[co + value_off:].split(b"\x00")[0].decode("utf-8", "ignore")
+                    if "claude.ai" in domain and name == "sessionKey" and value.startswith("sk-ant-"):
+                        return value
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+def _chrome_decrypt(key: bytes, encrypted: bytes) -> str | None:
+    if not encrypted:
+        return None
+    if encrypted[:3] != b"v10":
+        v = encrypted.decode("utf-8", "ignore")
+        return v if v.startswith("sk-ant-") else None
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+        iv = b" " * 16  # Chrome uses all-space IV with PBKDF2-SHA1 key derivation
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        dec = cipher.decryptor()
+        plain = dec.update(encrypted[3:]) + dec.finalize()
+        pad = plain[-1]
+        v = plain[:-pad].decode("utf-8", "ignore")
+        return v if v.startswith("sk-ant-") else None
+    except Exception:
+        return None
+
+
+def _read_chrome_cookie(db_path: str, keychain_service: str) -> str | None:
+    if not os.path.exists(db_path):
+        return None
+    key: bytes | None = None
+    try:
+        pw = subprocess.run(
+            ["security", "find-generic-password", "-w", "-s", keychain_service],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        key = hashlib.pbkdf2_hmac("sha1", pw.encode(), b"saltysalt", 1003, 16)
+    except Exception:
+        pass
+
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        shutil.copy2(db_path, tmp)
+        conn = sqlite3.connect(tmp)
+        row = conn.execute(
+            "SELECT value, encrypted_value FROM cookies "
+            "WHERE host_key LIKE '%claude.ai' AND name='sessionKey' "
+            "ORDER BY last_access_utc DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            plain = row[0]
+            if plain and plain.startswith("sk-ant-"):
+                return plain
+            if row[1] and key:
+                return _chrome_decrypt(key, row[1])
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return None
+
+
+def _read_firefox_cookie() -> str | None:
+    for db in glob.glob(str(Path.home() / "Library/Application Support/Firefox/Profiles/*/cookies.sqlite")):
+        fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            shutil.copy2(db, tmp)
+            conn = sqlite3.connect(tmp)
+            row = conn.execute(
+                "SELECT value FROM moz_cookies "
+                "WHERE host LIKE '%claude.ai' AND name='sessionKey' "
+                "ORDER BY lastAccessed DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if row and row[0].startswith("sk-ant-"):
+                return row[0]
+        except Exception:
+            pass
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return None
+
+
+def read_cookie() -> str | None:
+    """Search macOS browsers for a valid claude.ai sessionKey cookie.
+
+    Order: Safari → Chrome → Chromium → Brave → Firefox.
+    """
+    base = str(Path.home() / "Library/Application Support")
+    checks: list[tuple] = [
+        (_read_safari_cookie, []),
+        (_read_chrome_cookie, [f"{base}/Google/Chrome/Default/Cookies",      "Chrome Safe Storage"]),
+        (_read_chrome_cookie, [f"{base}/Chromium/Default/Cookies",            "Chromium Safe Storage"]),
+        (_read_chrome_cookie, [f"{base}/BraveSoftware/Brave-Browser/Default/Cookies", "Brave Safe Storage"]),
+        (_read_firefox_cookie, []),
+    ]
+    for fn, args in checks:
+        try:
+            val = fn(*args)
+            if val:
+                return val
+        except Exception:
+            pass
+    return None
+
+
+async def poll_via_cookie(cookie: str) -> dict | None:
+    headers = {"Cookie": f"sessionKey={cookie}", "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            orgs_resp = await http.get(WEB_ORG_URL, headers=headers)
+            if orgs_resp.status_code in (401, 403):
+                log("Cookie: session expired — log in to claude.ai in your browser")
+                return None
+            if orgs_resp.status_code != 200:
+                log(f"Cookie: orgs HTTP {orgs_resp.status_code}")
+                return None
+
+            orgs = orgs_resp.json()
+            if not isinstance(orgs, list) or not orgs:
+                log("Cookie: no orgs in response")
+                return None
+
+            org_id = None
+            for o in orgs:
+                if "chat" in o.get("capabilities", []):
+                    org_id = o["uuid"]; break
+            if not org_id:
+                for o in orgs:
+                    if o.get("capabilities") != ["api"]:
+                        org_id = o["uuid"]; break
+            if not org_id:
+                org_id = orgs[0]["uuid"]
+
+            usage_resp = await http.get(
+                f"https://claude.ai/api/organizations/{org_id}/usage",
+                headers=headers,
+            )
+            if usage_resp.status_code in (401, 403):
+                log("Cookie: session expired")
+                return None
+            if usage_resp.status_code != 200:
+                log(f"Cookie: usage HTTP {usage_resp.status_code}")
+                return None
+
+            return _build_payload(usage_resp.json())
+
+    except httpx.HTTPError as e:
+        log(f"Cookie poll failed: {e}")
+        return None
+    except Exception as e:
+        log(f"Cookie: payload parse failed: {e}")
+        return None
 
 
 class Session:
@@ -258,10 +494,12 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
                 token = read_token()
-                if not token:
-                    log("No token; skipping poll")
+                cookie = None if token else read_cookie()
+                if not token and not cookie:
+                    log("No credentials; skipping poll (try 'claude login' or log in to claude.ai)")
                 else:
-                    payload = await poll_api(token)
+                    payload = (await poll_oauth(token) if token
+                               else await poll_via_cookie(cookie))
                     if payload is not None:
                         if await session.write_payload(payload):
                             last_poll = time.time()

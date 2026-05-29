@@ -1,8 +1,9 @@
 #!/bin/bash
 # Claude Usage Tracker Daemon (BLE)
-# Reads Claude Code OAuth token, polls usage via API, sends to ESP32 over BLE GATT.
+# Polls /api/oauth/usage (Option A: OAuth token) or claude.ai org usage endpoint
+# (Option B: browser sessionKey cookie) and sends JSON over BLE GATT to ESP32.
 # Auto-connects and reconnects to the Claude Controller BLE device.
-# Dependencies: curl, awk, bluetoothctl
+# Dependencies: curl, python3, bluetoothctl
 
 DEVICE_NAME="Claude Controller"
 DEVICE_MAC="${DEVICE_MAC:-}"  # auto-discovered if empty
@@ -21,7 +22,210 @@ log() {
 }
 
 read_token() {
-    grep -o '"accessToken":"[^"]*"' "$HOME/.claude/.credentials.json" | cut -d'"' -f4
+    local creds="$HOME/.claude/.credentials.json"
+    [ -f "$creds" ] || return 1
+    local tok
+    tok=$(CREDS_FILE="$creds" python3 - <<'PYEOF'
+import json, os
+d = json.load(open(os.environ['CREDS_FILE']))
+print(d.get('oauth', {}).get('access_token', '') or d.get('accessToken', ''))
+PYEOF
+    )
+    [[ "$tok" == sk-ant-* ]] && echo "$tok" || return 1
+}
+
+# Extract sessionKey cookie from browser (Firefox → Chrome/Chromium → Brave)
+read_cookie() {
+    local cookie=""
+
+    # Firefox: no encryption on Linux; copy DB first to avoid lock
+    local ff_db
+    ff_db=$(find "$HOME/.mozilla/firefox" -name "cookies.sqlite" 2>/dev/null | head -1)
+    if [ -n "$ff_db" ]; then
+        cookie=$(python3 - "$ff_db" <<'PYEOF'
+import sqlite3, shutil, tempfile, os, sys
+src = sys.argv[1]
+fd, tmp = tempfile.mkstemp(suffix='.sqlite')
+os.close(fd)
+shutil.copy2(src, tmp)
+conn = None
+try:
+    conn = sqlite3.connect(tmp)
+    row = conn.execute(
+        "SELECT value FROM moz_cookies WHERE host LIKE '%claude.ai' AND name='sessionKey'"
+        " ORDER BY lastAccessed DESC LIMIT 1"
+    ).fetchone()
+    if row: print(row[0])
+finally:
+    if conn: conn.close()
+    os.unlink(tmp)
+PYEOF
+)
+        [[ "$cookie" == sk-ant-* ]] && echo "$cookie" && return 0
+    fi
+
+    # Chrome / Chromium / Brave (plain-text value only; encrypted values skipped)
+    local chrome_dir
+    for chrome_dir in \
+        "$HOME/.config/google-chrome" \
+        "$HOME/.config/chromium" \
+        "$HOME/.config/BraveSoftware/Brave-Browser"; do
+        local db="$chrome_dir/Default/Cookies"
+        [ -f "$db" ] || continue
+        cookie=$(python3 - "$db" <<'PYEOF'
+import sqlite3, shutil, tempfile, os, sys
+src = sys.argv[1]
+fd, tmp = tempfile.mkstemp(suffix='.sqlite')
+os.close(fd)
+shutil.copy2(src, tmp)
+conn = None
+try:
+    conn = sqlite3.connect(tmp)
+    row = conn.execute(
+        "SELECT value FROM cookies WHERE host_key LIKE '%claude.ai' AND name='sessionKey'"
+        " ORDER BY last_access_utc DESC LIMIT 1"
+    ).fetchone()
+    if row and row[0]: print(row[0])
+finally:
+    if conn: conn.close()
+    os.unlink(tmp)
+PYEOF
+)
+        [[ "$cookie" == sk-ant-* ]] && echo "$cookie" && return 0
+    done
+
+    return 1
+}
+
+# Parse /api/oauth/usage (or /api/organizations/{id}/usage) JSON into BLE payload.
+# Usage: _build_payload <json_body> <now_epoch>
+_build_payload() {
+    local body="$1"
+    local now="$2"
+    USAGE_JSON="$body" USAGE_NOW="$now" python3 - <<'PYEOF'
+import json, os, sys
+from datetime import datetime
+
+body = json.loads(os.environ['USAGE_JSON'])
+now = int(os.environ['USAGE_NOW'])
+
+def mins_until(iso):
+    if not iso: return -1
+    try:
+        ts = datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
+        return max(0, int((ts - now) / 60))
+    except:
+        return -1
+
+# five_hour preferred; falls back to weekly buckets if 5h window absent
+primary = None
+for key in ('five_hour', 'seven_day', 'seven_day_sonnet', 'seven_day_opus'):
+    w = body.get(key)
+    if w and w.get('utilization') is not None:
+        primary = w
+        break
+
+week = None
+for key in ('seven_day', 'seven_day_sonnet', 'seven_day_opus'):
+    w = body.get(key)
+    if w and w.get('utilization') is not None:
+        week = w
+        break
+
+su = round(primary['utilization']) if primary else 0
+sr = mins_until(primary.get('resets_at')) if primary else -1
+wu = round(week['utilization']) if week else 0
+wr = mins_until(week.get('resets_at')) if week else -1
+st = 'limited' if (su >= 100 or wu >= 100) else 'allowed'
+
+print('{"s":%d,"sr":%d,"w":%d,"wr":%d,"st":"%s","ok":true}' % (su, sr, wu, wr, st))
+PYEOF
+}
+
+_poll_oauth() {
+    local token="$1"
+    local now
+    now=$(date +%s)
+
+    local response body http_code
+    response=$(curl -s -w "\n%{http_code}" --max-time 30 \
+        "https://api.anthropic.com/api/oauth/usage" \
+        -H "Authorization: Bearer $token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "Accept: application/json" \
+        -H "User-Agent: claude-code/2.1.0" \
+        2>/dev/null)
+    http_code=$(echo "$response" | tail -1)
+    body=$(echo "$response" | head -n -1)
+
+    case "$http_code" in
+        200) ;;
+        401) log "OAuth: token expired — run 'claude login'"; return 1 ;;
+        403) log "OAuth: wrong token scope — run 'claude setup-token'"; return 1 ;;
+        429)
+            local retry_secs
+            retry_secs=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('retry_after',60))" 2>/dev/null || echo 60)
+            log "OAuth: rate limited, backing off ${retry_secs}s"
+            sleep "$retry_secs"
+            return 1 ;;
+        *) log "OAuth: HTTP $http_code"; return 1 ;;
+    esac
+
+    local payload
+    payload=$(_build_payload "$body" "$now") || { log "OAuth: payload parse failed"; return 1; }
+    log "Sending: $payload"
+    write_gatt "$RX_CHAR_PATH" "$payload" || { log "Write failed"; return 1; }
+}
+
+_poll_cookie() {
+    local cookie="$1"
+    local now
+    now=$(date +%s)
+
+    # Step 1: resolve org ID
+    local orgs_body
+    orgs_body=$(curl -s --max-time 15 \
+        "https://claude.ai/api/organizations" \
+        -H "Cookie: sessionKey=$cookie" \
+        -H "Accept: application/json" \
+        2>/dev/null)
+
+    local org_id
+    org_id=$(echo "$orgs_body" | python3 - <<'PYEOF'
+import json, sys
+orgs = json.loads(sys.stdin.read())
+if not isinstance(orgs, list) or not orgs: sys.exit(1)
+for o in orgs:
+    if 'chat' in o.get('capabilities', []):
+        print(o['uuid']); sys.exit(0)
+for o in orgs:
+    if o.get('capabilities') != ['api']:
+        print(o['uuid']); sys.exit(0)
+print(orgs[0]['uuid'])
+PYEOF
+)
+    [ -z "$org_id" ] && { log "Cookie: could not resolve org ID"; return 1; }
+
+    # Step 2: fetch usage
+    local response body http_code
+    response=$(curl -s -w "\n%{http_code}" --max-time 15 \
+        "https://claude.ai/api/organizations/$org_id/usage" \
+        -H "Cookie: sessionKey=$cookie" \
+        -H "Accept: application/json" \
+        2>/dev/null)
+    http_code=$(echo "$response" | tail -1)
+    body=$(echo "$response" | head -n -1)
+
+    case "$http_code" in
+        200) ;;
+        401|403) log "Cookie: session expired — log in to claude.ai in your browser"; return 1 ;;
+        *) log "Cookie: HTTP $http_code from usage endpoint"; return 1 ;;
+    esac
+
+    local payload
+    payload=$(_build_payload "$body" "$now") || { log "Cookie: payload parse failed"; return 1; }
+    log "Sending: $payload"
+    write_gatt "$RX_CHAR_PATH" "$payload" || { log "Write failed"; return 1; }
 }
 
 # Convert MAC to D-Bus path: AA:BB:CC:DD:EE:FF -> dev_AA_BB_CC_DD_EE_FF
@@ -192,48 +396,16 @@ write_gatt() {
 }
 
 poll() {
-    local token
-    token=$(read_token) || { log "Error: could not read token"; return 1; }
-    local now
-    now=$(date +%s)
-
-    local headers
-    headers=$(curl -s -D - -o /dev/null \
-        "https://api.anthropic.com/v1/messages" \
-        -H "Authorization: Bearer $token" \
-        -H "anthropic-version: 2023-06-01" \
-        -H "anthropic-beta: oauth-2025-04-20" \
-        -H "Content-Type: application/json" \
-        -H "User-Agent: claude-code/2.1.5" \
-        -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
-        2>/dev/null) || { log "Error: API call failed"; return 1; }
-
-    local s5h_util s5h_reset s7d_util s7d_reset status
-    s5h_util=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-5h-utilization" | tr -d '\r' | awk '{print $2}')
-    s5h_reset=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-5h-reset" | tr -d '\r' | awk '{print $2}')
-    s7d_util=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-7d-utilization" | tr -d '\r' | awk '{print $2}')
-    s7d_reset=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-7d-reset" | tr -d '\r' | awk '{print $2}')
-    status=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-5h-status" | tr -d '\r' | awk '{print $2}')
-
-    s5h_util=${s5h_util:-0}
-    s5h_reset=${s5h_reset:-0}
-    s7d_util=${s7d_util:-0}
-    s7d_reset=${s7d_reset:-0}
-    status=${status:-unknown}
-
-    local payload
-    payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$status" -v now="$now" \
-        'BEGIN {
-            sp = sprintf("%.0f", u5 * 100);
-            sr = (r5 - now) / 60; sr = sr > 0 ? sprintf("%.0f", sr) : 0;
-            wp = sprintf("%.0f", u7 * 100);
-            wr = (r7 - now) / 60; wr = wr > 0 ? sprintf("%.0f", wr) : 0;
-            printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"ok\":true}", sp, sr, wp, wr, st;
-        }')
-
-    log "Sending: $payload"
-    write_gatt "$RX_CHAR_PATH" "$payload" || { log "Write failed"; return 1; }
-    return 0
+    local token cookie
+    if token=$(read_token); then
+        _poll_oauth "$token" && return 0
+    fi
+    if cookie=$(read_cookie); then
+        log "OAuth unavailable, falling back to browser cookie"
+        _poll_cookie "$cookie" && return 0
+    fi
+    log "Error: no valid credentials — run 'claude login' or log in to claude.ai in your browser"
+    return 1
 }
 
 cleanup() {
