@@ -135,6 +135,10 @@ static uint8_t anim_msg_idx = 0;
 static uint32_t anim_msg_start = 0;
 #define ANIM_MSG_MS     4000
 
+static void logo_scale_cb(void* obj, int32_t val) {
+    lv_obj_set_style_transform_scale((lv_obj_t*)obj, val, 0);
+}
+
 static const char* const spinner_frames[] = {
     "\xC2\xB7", "\xE2\x9C\xBB", "\xE2\x9C\xBD",
     "\xE2\x9C\xB6", "\xE2\x9C\xB3", "\xE2\x9C\xA2",
@@ -440,6 +444,20 @@ void ui_init(void) {
     logo_img = lv_image_create(scr);
     lv_image_set_src(logo_img, &logo_dsc);
     lv_obj_set_pos(logo_img, L.margin, L.title_y - 10);
+    lv_obj_set_style_transform_pivot_x(logo_img, LOGO_WIDTH / 2, 0);
+    lv_obj_set_style_transform_pivot_y(logo_img, LOGO_HEIGHT / 2, 0);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, logo_img);
+    lv_anim_set_exec_cb(&a, logo_scale_cb);
+    lv_anim_set_values(&a, 256, 285);
+    lv_anim_set_duration(&a, 350);
+    lv_anim_set_reverse_duration(&a, 500);
+    lv_anim_set_repeat_delay(&a, 900);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
 
     battery_img = lv_image_create(scr);
     lv_image_set_src(battery_img, &battery_dscs[0]);
