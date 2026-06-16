@@ -225,7 +225,7 @@ void setup() {
 }
 
 static ble_state_t last_ble_state = BLE_STATE_INIT;
-static uint32_t    reset_anim_until = 0;
+static uint32_t    reset_anim_start = 0;
 
 void loop() {
     idle_tick();
@@ -326,7 +326,7 @@ void loop() {
                     session_reset, weekly_reset);
                 ui_show_screen(SCREEN_SPLASH);
                 splash_pick_for_current_rate();
-                reset_anim_until = millis() + 5000;
+                reset_anim_start = millis();
             }
             last_session_pct = usage.session_pct;
             last_weekly_pct  = usage.weekly_pct;
@@ -337,8 +337,8 @@ void loop() {
         }
     }
 
-    if (reset_anim_until && millis() >= reset_anim_until) {
-        reset_anim_until = 0;
+    if (reset_anim_start && (millis() - reset_anim_start) >= 5000) {
+        reset_anim_start = 0;
         if (ui_get_current_screen() == SCREEN_SPLASH) ui_show_screen(SCREEN_USAGE);
     }
 
