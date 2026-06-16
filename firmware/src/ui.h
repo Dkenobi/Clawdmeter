@@ -18,3 +18,4 @@ void ui_toggle_splash(void);
 screen_t ui_get_current_screen(void);
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac);
 void ui_update_battery(int percent, bool charging);
+void ui_set_clock_ref(uint32_t local_unix, uint32_t ms_at_recv);

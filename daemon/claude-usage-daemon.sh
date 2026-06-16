@@ -138,7 +138,9 @@ wu = round(week['utilization']) if week else 0
 wr = mins_until(week.get('resets_at')) if week else -1
 st = 'limited' if (su >= 100 or wu >= 100) else 'allowed'
 
-print('{"s":%d,"sr":%d,"w":%d,"wr":%d,"st":"%s","ok":true}' % (su, sr, wu, wr, st))
+from datetime import datetime, timezone
+tz_min = int(datetime.now(timezone.utc).astimezone().utcoffset().total_seconds() / 60)
+print('{"s":%d,"sr":%d,"w":%d,"wr":%d,"st":"%s","ts":%d,"tz":%d,"ok":true}' % (su, sr, wu, wr, st, now, tz_min))
 PYEOF
 }
 

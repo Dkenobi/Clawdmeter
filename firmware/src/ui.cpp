@@ -123,6 +123,11 @@ static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
 static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 
+// ---- Clock ----
+static lv_obj_t* lbl_clock;
+static uint32_t clock_unix_ref = 0;  // local unix seconds at last BLE receipt
+static uint32_t clock_ms_ref   = 0;  // millis() at last BLE receipt
+
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
@@ -340,6 +345,16 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_text_font(lbl_anim, &font_mono_32, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
+
+    // Clock: right-aligned in header, 8 px left of battery icon.
+    // Battery sits at (scr_w - 48 - margin, title_y); clock right-edge lands at
+    // (scr_w - 48 - margin - 8) = scr_w - 76 from left, which is -(48+margin+8)
+    // from the container's right edge.
+    lbl_clock = lv_label_create(usage_container);
+    lv_label_set_text(lbl_clock, "--:--");
+    lv_obj_set_style_text_font(lbl_clock, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_clock, COL_DIM, 0);
+    lv_obj_align(lbl_clock, LV_ALIGN_TOP_RIGHT, -(48 + L.margin + 8), L.title_y + 4);
 }
 
 // ======== Bluetooth Screen ========
@@ -506,10 +521,30 @@ void ui_update(const UsageData* data) {
     lv_label_set_text(lbl_weekly_reset, buf);
 }
 
+void ui_set_clock_ref(uint32_t local_unix, uint32_t ms_at_recv) {
+    clock_unix_ref = local_unix;
+    clock_ms_ref   = ms_at_recv;
+}
+
 void ui_tick_anim(void) {
     if (current_screen != SCREEN_USAGE) return;
 
     uint32_t now = lv_tick_get();
+
+    // Clock — update label once per second.
+    if (clock_unix_ref != 0) {
+        static uint32_t last_clock_ms = 0;
+        if (now - last_clock_ms >= 1000) {
+            last_clock_ms = now;
+            uint32_t elapsed_s  = (now - clock_ms_ref) / 1000;
+            uint32_t sec_of_day = (clock_unix_ref + elapsed_s) % 86400;
+            int hour   = (int)(sec_of_day / 3600);
+            int minute = (int)((sec_of_day % 3600) / 60);
+            static char tbuf[8];
+            snprintf(tbuf, sizeof(tbuf), "%02d:%02d", hour, minute);
+            lv_label_set_text(lbl_clock, tbuf);
+        }
+    }
 
     if (now - anim_msg_start >= ANIM_MSG_MS) {
         anim_msg_idx = (anim_msg_idx + 1) % ANIM_MSG_COUNT;

@@ -195,7 +195,10 @@ def _build_payload(usage: dict) -> dict:
     wr = mins_until(week.get("resets_at")) if week else -1
     st = "limited" if (su >= 100 or wu >= 100) else "allowed"
 
-    return {"s": su, "sr": sr, "w": wu, "wr": wr, "st": st, "ok": True}
+    tz_min = int(datetime.datetime.now(datetime.timezone.utc).astimezone()
+                 .utcoffset().total_seconds() / 60)
+    return {"s": su, "sr": sr, "w": wu, "wr": wr, "st": st,
+            "ts": int(now), "tz": tz_min, "ok": True}
 
 
 async def poll_oauth(token: str) -> dict | None:

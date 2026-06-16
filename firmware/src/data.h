@@ -9,4 +9,6 @@ struct UsageData {
     char status[16];         // "allowed" or "limited"
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
+    uint32_t ts_unix;        // UTC unix timestamp from daemon, 0 = absent
+    int16_t tz_min;          // UTC offset in minutes (e.g. -420 for PDT)
 };

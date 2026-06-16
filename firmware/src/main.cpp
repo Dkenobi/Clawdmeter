@@ -110,6 +110,8 @@ static bool parse_json(const char* json, UsageData* out) {
     out->weekly_reset_mins = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->ok = doc["ok"] | false;
+    out->ts_unix = doc["ts"] | (uint32_t)0;
+    out->tz_min  = doc["tz"] | (int16_t)0;
     out->valid = true;
     return true;
 }
@@ -315,6 +317,11 @@ void loop() {
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
             ui_update(&usage);
+            if (usage.ts_unix != 0) {
+                uint32_t local_unix = (uint32_t)((int32_t)usage.ts_unix
+                                                + (int32_t)usage.tz_min * 60);
+                ui_set_clock_ref(local_unix, millis());
+            }
             ble_send_ack();
         } else {
             ble_send_nack();
