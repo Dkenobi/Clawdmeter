@@ -225,6 +225,7 @@ void setup() {
 }
 
 static ble_state_t last_ble_state = BLE_STATE_INIT;
+static uint32_t    reset_anim_start = 0;
 
 void loop() {
     idle_tick();
@@ -315,10 +316,30 @@ void loop() {
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
             ui_update(&usage);
+
+            static float last_session_pct = -1.0f;
+            static float last_weekly_pct  = -1.0f;
+            bool session_reset = last_session_pct >= 5.0f && usage.session_pct < 1.0f;
+            bool weekly_reset  = last_weekly_pct  >= 5.0f && usage.weekly_pct  < 1.0f;
+            if (session_reset || weekly_reset) {
+                Serial.printf("usage reset: session=%d weekly=%d — showing splash\n",
+                    session_reset, weekly_reset);
+                ui_show_screen(SCREEN_SPLASH);
+                splash_pick_for_current_rate();
+                reset_anim_start = millis();
+            }
+            last_session_pct = usage.session_pct;
+            last_weekly_pct  = usage.weekly_pct;
+
             ble_send_ack();
         } else {
             ble_send_nack();
         }
+    }
+
+    if (reset_anim_start && (millis() - reset_anim_start) >= 5000) {
+        reset_anim_start = 0;
+        if (ui_get_current_screen() == SCREEN_SPLASH) ui_show_screen(SCREEN_USAGE);
     }
 
     delay(5);
