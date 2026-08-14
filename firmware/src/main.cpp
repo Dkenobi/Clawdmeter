@@ -20,6 +20,8 @@
 #include "hal/imu_hal.h"
 
 static UsageData usage = {};
+static uint32_t startup_end_ms     = 0;
+static uint32_t celebration_end_ms = 0;
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -71,6 +73,7 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
                 touch_wake_swallowed = true;
                 pressed = false;
             }
+            startup_end_ms = 0;  // any touch cancels startup auto-return
         } else if (!raw_pressed && touch_was) {
             // Release edge.
             if (touch_wake_swallowed) {
@@ -221,6 +224,7 @@ void setup() {
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
+    startup_end_ms = millis() + 10000;
 
     Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
         board_caps().name, W, H);
@@ -255,6 +259,7 @@ void loop() {
         bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
         if (primary_now != primary_was) {
             if (primary_now) {
+                startup_end_ms = 0;
                 if (idle_consume_wake_press()) primary_wake_swallowed = true;
                 else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
             } else {
@@ -270,6 +275,7 @@ void loop() {
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
             if (secondary_now != secondary_was) {
                 if (secondary_now) {
+                    startup_end_ms = 0;
                     if (idle_consume_wake_press()) secondary_wake_swallowed = true;
                     else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
                 } else {
@@ -281,6 +287,7 @@ void loop() {
         }
 
         if (power_hal_pwr_pressed()) {
+            startup_end_ms = 0;
             if (!idle_consume_wake_press()) {
                 if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
                 else                                          ui_cycle_screen();
@@ -306,6 +313,20 @@ void loop() {
 
     check_serial_cmd();
 
+    if (startup_end_ms != 0 && millis() >= startup_end_ms) {
+        startup_end_ms = 0;
+        if (ui_get_current_screen() == SCREEN_SPLASH) {
+            ui_show_screen(SCREEN_USAGE);
+        }
+    }
+
+    if (celebration_end_ms != 0 && millis() >= celebration_end_ms) {
+        celebration_end_ms = 0;
+        if (ui_get_current_screen() == SCREEN_SPLASH) {
+            ui_show_screen(SCREEN_USAGE);
+        }
+    }
+
     if (ble_has_data()) {
         if (parse_json(ble_get_data(), &usage)) {
             int g_before = usage_rate_group();
@@ -316,6 +337,19 @@ void loop() {
                     g_before, g_after, usage.session_pct);
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
+
+            // Session-reset celebration: jump to splash when the 5-hour window
+            // resets. prev < 0 on first receipt — skip that transition.
+            static float prev_session_pct = -1.0f;
+            if (prev_session_pct > 5.0f && usage.session_pct <= 1.0f) {
+                Serial.printf("Session reset (%.1f%% -> %.1f%%), showing splash\n",
+                    prev_session_pct, usage.session_pct);
+                splash_pick_for_current_rate();
+                ui_show_screen(SCREEN_SPLASH);
+                celebration_end_ms = millis() + 5000;
+            }
+            prev_session_pct = usage.session_pct;
+
             ui_update(&usage);
             if (usage.ts_unix != 0) {
                 uint32_t local_unix = (uint32_t)((int32_t)usage.ts_unix
