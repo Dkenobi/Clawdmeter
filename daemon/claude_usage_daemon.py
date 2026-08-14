@@ -50,6 +50,12 @@ SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-addres
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 WEB_ORG_URL = "https://claude.ai/api/organizations"
 
+# OAuth token refresh (same public client Claude Code itself uses).
+OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000  # refresh 5 min before expiry
+MAX_BACKOFF = 300  # cap 429 retry-after so shutdown stays responsive
+
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -90,7 +96,14 @@ def _extract_access_token(blob: str) -> str | None:
     return None
 
 
-def _read_token_keychain() -> str | None:
+def _read_credentials_blob() -> str | None:
+    """Read the raw credentials blob from Keychain (macOS) or disk (Linux)."""
+    if sys.platform != "darwin":
+        try:
+            return CREDENTIALS_PATH.read_text()
+        except OSError as e:
+            log(f"Error reading credentials: {e}")
+            return None
     try:
         out = subprocess.run(
             [
@@ -113,22 +126,146 @@ def _read_token_keychain() -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log(f"Keychain access error: {e}")
         return None
-    return _extract_access_token(out.stdout)
+    return out.stdout
 
 
-def _read_token_file() -> str | None:
+def _write_credentials_blob(blob: str) -> bool:
+    """Persist a refreshed credentials blob back to Keychain / disk.
+
+    Note: on macOS the blob is passed to `security` via argv, so it is briefly
+    visible to other processes owned by this user. Those processes can already
+    read the same secret straight out of the Keychain, so this does not widen
+    the trust boundary.
+    """
+    if sys.platform != "darwin":
+        try:
+            CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CREDENTIALS_PATH.write_text(blob)
+            CREDENTIALS_PATH.chmod(0o600)
+            return True
+        except OSError as e:
+            log(f"Error writing credentials: {e}")
+            return False
     try:
-        raw = CREDENTIALS_PATH.read_text()
-    except OSError as e:
-        log(f"Error reading credentials: {e}")
+        subprocess.run(
+            [
+                "security",
+                "add-generic-password",
+                "-U",  # update if the item already exists
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                getpass.getuser(),
+                "-w",
+                blob,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"Keychain write failed (rc={e.returncode}): {e.stderr.strip()}")
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"Keychain write error: {e}")
+        return False
+
+
+def _find_oauth_node(data: object) -> dict | None:
+    """Locate the dict holding accessToken/refreshToken in a credentials blob."""
+    if not isinstance(data, dict):
         return None
-    return _extract_access_token(raw)
+    if isinstance(data.get("accessToken"), str):
+        return data
+    for v in data.values():
+        if isinstance(v, dict) and isinstance(v.get("accessToken"), str):
+            return v
+    return None
 
 
-def read_token() -> str | None:
-    if sys.platform == "darwin":
-        return _read_token_keychain()
-    return _read_token_file()
+def _parse_credentials(blob: str) -> tuple[dict | None, dict | None]:
+    """Return (whole_blob_dict, oauth_node) if the blob is structured JSON."""
+    try:
+        data = json.loads(blob.strip())
+    except (json.JSONDecodeError, AttributeError):
+        return None, None
+    return (data if isinstance(data, dict) else None), _find_oauth_node(data)
+
+
+async def _refresh_oauth_token(blob_data: dict, oauth: dict) -> str | None:
+    """Exchange refreshToken for a new accessToken; persist and return it."""
+    refresh_token = oauth.get("refreshToken")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        log("OAuth: no refresh token stored — run 'claude login'")
+        return None
+
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            resp = await http.post(OAUTH_TOKEN_URL, json=payload)
+    except httpx.HTTPError as e:
+        log(f"OAuth refresh failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        log(f"OAuth refresh rejected (HTTP {resp.status_code}) — run 'claude login'")
+        return None
+
+    try:
+        new = resp.json()
+    except ValueError:
+        log("OAuth refresh: unparseable response")
+        return None
+
+    access = new.get("access_token")
+    if not isinstance(access, str) or not access:
+        log("OAuth refresh: response had no access_token")
+        return None
+
+    oauth["accessToken"] = access
+    if isinstance(new.get("refresh_token"), str):
+        oauth["refreshToken"] = new["refresh_token"]
+    expires_in = new.get("expires_in")
+    if isinstance(expires_in, (int, float)):
+        oauth["expiresAt"] = int((time.time() + expires_in) * 1000)
+
+    if _write_credentials_blob(json.dumps(blob_data)):
+        log("OAuth: token refreshed")
+    else:
+        log("OAuth: token refreshed but could not be persisted")
+    return access
+
+
+async def read_token() -> str | None:
+    """Return a currently-valid access token, refreshing it if needed.
+
+    Returns None when no usable token exists, so the caller can fall back to
+    the browser-cookie path instead of hammering the API with a dead token.
+    """
+    blob = _read_credentials_blob()
+    if not blob or not blob.strip():
+        return None
+
+    blob_data, oauth = _parse_credentials(blob)
+    if blob_data is None or oauth is None:
+        # Unstructured blob (raw token or unexpected shape): no expiry to check.
+        return _extract_access_token(blob)
+
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)):
+        # expiresAt is milliseconds since epoch. Refresh a little early so a
+        # token doesn't expire mid-poll.
+        if time.time() * 1000 >= expires_at - TOKEN_REFRESH_SKEW_MS:
+            return await _refresh_oauth_token(blob_data, oauth)
+
+    access = oauth.get("accessToken")
+    return access if isinstance(access, str) and access else None
 
 
 def load_cached_address() -> str | None:
@@ -201,7 +338,7 @@ def _build_payload(usage: dict) -> dict:
             "ts": int(now), "tz": tz_min, "ok": True}
 
 
-async def poll_oauth(token: str) -> dict | None:
+async def poll_oauth(token: str, stop_event: asyncio.Event | None = None) -> dict | None:
     headers = {
         "Authorization": f"Bearer {token}",
         "anthropic-beta": "oauth-2025-04-20",
@@ -223,8 +360,17 @@ async def poll_oauth(token: str) -> dict | None:
         return None
     if resp.status_code == 429:
         retry = resp.headers.get("retry-after", "60")
-        log(f"OAuth: rate limited, backing off {retry}s")
-        await asyncio.sleep(float(retry) if retry.isdigit() else 60)
+        delay = min(float(retry) if retry.isdigit() else 60, MAX_BACKOFF)
+        log(f"OAuth: rate limited, backing off {delay:.0f}s")
+        # Race the shutdown flag — a bare sleep here made SIGTERM take up to an
+        # hour to land (the daemon appeared to hang and needed kill -9).
+        if stop_event is not None:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(delay)
         return None
     if resp.status_code != 200:
         log(f"OAuth: HTTP {resp.status_code}")
@@ -496,12 +642,17 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                token = read_token()
+                # Rate-limit the *attempt*, not just the success. Updating
+                # last_poll only on success left this branch permanently true
+                # and retried every TICK (5s) instead of every POLL_INTERVAL,
+                # which is what earned the 429s in the first place.
+                last_poll = time.time()
+                token = await read_token()
                 cookie = None if token else read_cookie()
                 if not token and not cookie:
                     log("No credentials; skipping poll (try 'claude login' or log in to claude.ai)")
                 else:
-                    payload = (await poll_oauth(token) if token
+                    payload = (await poll_oauth(token, stop_event) if token
                                else await poll_via_cookie(cookie))
                     if payload is not None:
                         if await session.write_payload(payload):
